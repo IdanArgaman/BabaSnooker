@@ -40,12 +40,33 @@ const BALL_COLORS: Record<string, string> = {
   black: "#111111",
 };
 
+// ── Vector display constants ─────────────────────────────────────
+const VEC_SCALE_VELOCITY = 18; // scale factor for velocity arrows
+const VEC_SCALE_FRICTION = 800; // scale factor for friction arrows
+const VEC_SCALE_FORCE = 6000; // scale factor for applied-force arrows
+const FORCE_FADE_MS = 2000; // how long the applied-force arrow lingers
+const MIN_SPEED_FOR_VECTORS = 0.2; // don't draw vectors on nearly-stopped balls
+
+const VECTOR_COLORS = {
+  velocity: "#00e5ff", // cyan
+  friction: "#ff9100", // orange
+  force: "#ffee58", // yellow
+};
+
+// ── Physics defaults (used for sliders + ball creation) ──────────
+const DEFAULTS = {
+  frictionAir: 0.012,
+  friction: 0.05,
+  density: 0.005, // controls mass (mass = density × area)
+  restitution: 0.85,
+};
+
 // ── Physics constants ─────────────────────────────────────────────
 const BALL_OPTS: Matter.IBodyDefinition = {
-  restitution: 0.85,
-  friction: 0.05,
-  frictionAir: 0.012,
-  density: 0.005,
+  restitution: DEFAULTS.restitution,
+  friction: DEFAULTS.friction,
+  frictionAir: DEFAULTS.frictionAir,
+  density: DEFAULTS.density,
   slop: 0,
 };
 
@@ -192,6 +213,55 @@ function createRails(): Matter.Body[] {
   ];
 }
 
+// ── Arrow drawing helper ─────────────────────────────────────────
+function drawArrow(
+  ctx: CanvasRenderingContext2D,
+  fromX: number,
+  fromY: number,
+  toX: number,
+  toY: number,
+  color: string,
+  lineWidth: number = 2,
+  alpha: number = 1
+) {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 2) return; // too short to draw
+
+  const headLen = Math.min(8, len * 0.35);
+  const angle = Math.atan2(dy, dx);
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  // Shaft
+  ctx.beginPath();
+  ctx.moveTo(fromX, fromY);
+  ctx.lineTo(toX, toY);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = "round";
+  ctx.stroke();
+
+  // Arrowhead
+  ctx.beginPath();
+  ctx.moveTo(toX, toY);
+  ctx.lineTo(
+    toX - headLen * Math.cos(angle - Math.PI / 6),
+    toY - headLen * Math.sin(angle - Math.PI / 6)
+  );
+  ctx.lineTo(
+    toX - headLen * Math.cos(angle + Math.PI / 6),
+    toY - headLen * Math.sin(angle + Math.PI / 6)
+  );
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  ctx.restore();
+}
+
 // ── Ball positions (snooker layout) ───────────────────────────────
 function createBalls(): { cueBall: Matter.Body; objectBalls: Matter.Body[] } {
   const tableL = CUSHION;
@@ -258,6 +328,36 @@ export default function SnookerGame() {
   const [isAiming, setIsAiming] = useState(false);
   const allBallsRef = useRef<Matter.Body[]>([]);
   const [isCueBallPotted, setIsCueBallPotted] = useState(false);
+
+  // Vector display state
+  const [showVectors, setShowVectors] = useState(true);
+  const showVectorsRef = useRef(true);
+  // Track the last applied force { fx, fy, time } so we can draw it fading out
+  const lastForceRef = useRef<{
+    fx: number;
+    fy: number;
+    time: number;
+  } | null>(null);
+
+  // ── Physics settings state ────────────────────────────────────
+  const [settingsOpen, setSettingsOpen] = useState(true);
+  const [friction, setFriction] = useState(DEFAULTS.friction);
+  const [density, setDensity] = useState(DEFAULTS.density);
+
+  // Apply current physics settings to every ball on the table
+  const applyPhysicsSettings = useCallback(
+    (fr: number, dn: number) => {
+      const world = engineRef.current?.world;
+      if (!world) return;
+      Composite.allBodies(world)
+        .filter((b) => !b.isStatic && !b.isSensor)
+        .forEach((b) => {
+          b.friction = fr;
+          Body.setDensity(b, dn);
+        });
+    },
+    []
+  );
 
   // Reset cue ball to original position
   const resetCueBall = useCallback(() => {
@@ -438,10 +538,12 @@ export default function SnookerGame() {
 
       if (power > 5) {
         const angle = Math.atan2(dy, dx);
-        Body.applyForce(cue, cue.position, {
-          x: Math.cos(angle) * force,
-          y: Math.sin(angle) * force,
-        });
+        const fx = Math.cos(angle) * force;
+        const fy = Math.sin(angle) * force;
+        Body.applyForce(cue, cue.position, { x: fx, y: fy });
+
+        // Store the applied force for vector visualisation
+        lastForceRef.current = { fx, fy, time: Date.now() };
       }
 
       isDraggingRef.current = false;
@@ -558,9 +660,10 @@ export default function SnookerGame() {
       }
 
       // Ball shine effect
-      Composite.allBodies(engine.world)
-        .filter((b) => !b.isStatic && !b.isSensor)
-        .forEach((b) => {
+      const movingBalls = Composite.allBodies(engine.world)
+        .filter((b) => !b.isStatic && !b.isSensor);
+
+      movingBalls.forEach((b) => {
           const r = BALL_R;
           const gradient = ctx.createRadialGradient(
             b.position.x - r * 0.3,
@@ -577,6 +680,97 @@ export default function SnookerGame() {
           ctx.fillStyle = gradient;
           ctx.fill();
         });
+
+      // ── Physics vector overlays ─────────────────────────────────
+      if (showVectorsRef.current) {
+        movingBalls.forEach((b) => {
+          const speed = Vector.magnitude(b.velocity);
+          if (speed < MIN_SPEED_FOR_VECTORS) return;
+
+          const px = b.position.x;
+          const py = b.position.y;
+
+          // 1) Velocity vector (cyan) ─────────────────────────────
+          const vx = b.velocity.x * VEC_SCALE_VELOCITY;
+          const vy = b.velocity.y * VEC_SCALE_VELOCITY;
+          drawArrow(ctx, px, py, px + vx, py + vy, VECTOR_COLORS.velocity, 2.5, 0.9);
+
+          // Label "v"
+          ctx.save();
+          ctx.font = "bold 10px monospace";
+          ctx.fillStyle = VECTOR_COLORS.velocity;
+          ctx.globalAlpha = 0.85;
+          ctx.fillText("v", px + vx + 4, py + vy - 4);
+          ctx.restore();
+
+          // 2) Friction force vector (orange) ─────────────────────
+          // F_friction = -frictionAir * v * mass  (approximate damping force)
+          const mass = b.mass;
+          const frictionAir = b.frictionAir;
+          const ffx = -b.velocity.x * frictionAir * mass * VEC_SCALE_FRICTION;
+          const ffy = -b.velocity.y * frictionAir * mass * VEC_SCALE_FRICTION;
+          drawArrow(ctx, px, py, px + ffx, py + ffy, VECTOR_COLORS.friction, 2, 0.8);
+
+          // Label "f"
+          ctx.save();
+          ctx.font = "bold 10px monospace";
+          ctx.fillStyle = VECTOR_COLORS.friction;
+          ctx.globalAlpha = 0.8;
+          ctx.fillText("f", px + ffx + 4, py + ffy - 4);
+          ctx.restore();
+        });
+
+        // 3) Applied force vector on cue ball (yellow, fading) ───
+        const lastForce = lastForceRef.current;
+        const cueBallBody = cueBallRef.current;
+        if (lastForce && cueBallBody) {
+          const elapsed = Date.now() - lastForce.time;
+          if (elapsed < FORCE_FADE_MS) {
+            const alpha = 1 - elapsed / FORCE_FADE_MS;
+            const px = cueBallBody.position.x;
+            const py = cueBallBody.position.y;
+            const afx = lastForce.fx * VEC_SCALE_FORCE;
+            const afy = lastForce.fy * VEC_SCALE_FORCE;
+            drawArrow(ctx, px, py, px + afx, py + afy, VECTOR_COLORS.force, 3, alpha);
+
+            // Label "F"
+            ctx.save();
+            ctx.font = "bold 11px monospace";
+            ctx.fillStyle = VECTOR_COLORS.force;
+            ctx.globalAlpha = alpha;
+            ctx.fillText("F", px + afx + 5, py + afy - 5);
+            ctx.restore();
+          }
+        }
+
+        // ── Legend (top-right corner on canvas) ────────────────────
+        const legendX = CANVAS_W - 200;
+        const legendY = CUSHION + 14;
+        const lineH = 18;
+
+        ctx.save();
+        // Background
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.beginPath();
+        ctx.roundRect(legendX - 10, legendY - 14, 190, lineH * 3 + 22, 8);
+        ctx.fill();
+
+        ctx.font = "bold 11px monospace";
+
+        // Velocity
+        ctx.fillStyle = VECTOR_COLORS.velocity;
+        ctx.fillText("\u2192 v  = Velocity", legendX + 6, legendY + 4);
+
+        // Friction
+        ctx.fillStyle = VECTOR_COLORS.friction;
+        ctx.fillText("\u2192 f  = Friction Force", legendX + 6, legendY + 4 + lineH);
+
+        // Applied Force
+        ctx.fillStyle = VECTOR_COLORS.force;
+        ctx.fillText("\u2192 F  = Applied Force", legendX + 6, legendY + 4 + lineH * 2);
+
+        ctx.restore();
+      }
     });
 
     // ── Apply friction / damping each update ─────────────────────
@@ -649,6 +843,17 @@ export default function SnookerGame() {
 
       {/* Controls */}
       <div className="controls">
+        <button
+          className={`btn btn-vectors ${showVectors ? "active" : ""}`}
+          onClick={() => {
+            setShowVectors((v) => {
+              showVectorsRef.current = !v;
+              return !v;
+            });
+          }}
+        >
+          {showVectors ? "Hide Vectors" : "Show Vectors"}
+        </button>
         {isCueBallPotted && (
           <button className="btn btn-warning" onClick={resetCueBall}>
             Replace Cue Ball
@@ -657,6 +862,91 @@ export default function SnookerGame() {
         <button className="btn btn-reset" onClick={resetGame}>
           New Game
         </button>
+      </div>
+
+      {/* ── Physics Settings Panel ──────────────────────────────── */}
+      <div className="settings-panel">
+        <button
+          className="settings-toggle"
+          onClick={() => setSettingsOpen((o) => !o)}
+        >
+          Physics Settings
+          <span className={`settings-chevron ${settingsOpen ? "open" : ""}`}>
+            &#9662;
+          </span>
+        </button>
+
+        {settingsOpen && (
+          <div className="settings-body">
+            {/* Surface Friction */}
+            <div className="setting-row">
+              <label className="setting-label">
+                Friction
+                <span className="setting-value">{friction.toFixed(3)}</span>
+              </label>
+              <input
+                type="range"
+                className="setting-slider"
+                min={0}
+                max={0.5}
+                step={0.005}
+                value={friction}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setFriction(v);
+                  applyPhysicsSettings(v, density);
+                }}
+              />
+              <div className="setting-range-labels">
+                <span>0 (ice)</span>
+                <span>0.5 (rough)</span>
+              </div>
+            </div>
+
+            {/* Ball Mass (density) */}
+            <div className="setting-row">
+              <label className="setting-label">
+                Ball Mass
+                <span className="setting-value">
+                  {density.toFixed(4)}
+                  <span className="setting-unit"> kg/px&sup2;</span>
+                </span>
+              </label>
+              <input
+                type="range"
+                className="setting-slider"
+                min={0.001}
+                max={0.02}
+                step={0.0005}
+                value={density}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setDensity(v);
+                  applyPhysicsSettings(friction, v);
+                }}
+              />
+              <div className="setting-range-labels">
+                <span>0.001 (light)</span>
+                <span>0.02 (heavy)</span>
+              </div>
+            </div>
+
+            {/* Reset to defaults */}
+            <button
+              className="btn btn-defaults"
+              onClick={() => {
+                setFriction(DEFAULTS.friction);
+                setDensity(DEFAULTS.density);
+                applyPhysicsSettings(
+                  DEFAULTS.friction,
+                  DEFAULTS.density
+                );
+              }}
+            >
+              Reset to Defaults
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Potted balls display */}
