@@ -70,7 +70,7 @@ const BALL_OPTS: Matter.IBodyDefinition = {
   slop: 0,
 };
 
-const CUSHION_OPTS: Matter.IBodyDefinition = {
+const CUSHION_OPTS: Matter.IChamferableBodyDefinition = {
   isStatic: true,
   restitution: 0.7,
   friction: 0.05,
