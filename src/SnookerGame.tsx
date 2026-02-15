@@ -55,8 +55,9 @@ const VECTOR_COLORS = {
 
 // ── Physics defaults (used for sliders + ball creation) ──────────
 const DEFAULTS = {
-  frictionAir: 0.012,
-  friction: 0.05,
+  frictionAir: 0.018, // velocity-proportional drag (applied every frame)
+  friction: 0.05, // contact friction (ball-to-ball / ball-to-cushion)
+  rollingFriction: 0.0006, // constant deceleration per tick (simulates felt)
   density: 0.005, // controls mass (mass = density × area)
   restitution: 0.85,
 };
@@ -341,18 +342,23 @@ export default function SnookerGame() {
 
   // ── Physics settings state ────────────────────────────────────
   const [settingsOpen, setSettingsOpen] = useState(true);
-  const [friction, setFriction] = useState(DEFAULTS.friction);
+  const [frictionAir, setFrictionAir] = useState(DEFAULTS.frictionAir);
+  const [rollingFriction, setRollingFriction] = useState(DEFAULTS.rollingFriction);
   const [density, setDensity] = useState(DEFAULTS.density);
+
+  // Ref so the beforeUpdate callback always reads the latest value
+  const rollingFrictionRef = useRef(DEFAULTS.rollingFriction);
 
   // Apply current physics settings to every ball on the table
   const applyPhysicsSettings = useCallback(
-    (fr: number, dn: number) => {
+    (fAir: number, rf: number, dn: number) => {
       const world = engineRef.current?.world;
       if (!world) return;
+      rollingFrictionRef.current = rf;
       Composite.allBodies(world)
         .filter((b) => !b.isStatic && !b.isSensor)
         .forEach((b) => {
-          b.friction = fr;
+          b.frictionAir = fAir; // this is the drag that actually slows rolling balls
           Body.setDensity(b, dn);
         });
     },
@@ -774,15 +780,33 @@ export default function SnookerGame() {
     });
 
     // ── Apply friction / damping each update ─────────────────────
+    // Matter.js `frictionAir` provides velocity-proportional drag (v *= 1-frictionAir).
+    // Real rolling friction on felt is roughly constant (independent of speed),
+    // so we add a custom constant deceleration on top of the air drag.
     Events.on(engine, "beforeUpdate", () => {
       Composite.allBodies(engine.world)
         .filter((b) => !b.isStatic && !b.isSensor)
         .forEach((b) => {
           const speed = Vector.magnitude(b.velocity);
+
           // Stop very slow balls to avoid endless rolling
           if (speed > 0 && speed < 0.15) {
             Body.setVelocity(b, { x: 0, y: 0 });
             Body.setAngularVelocity(b, 0);
+            return;
+          }
+
+          // Apply constant rolling friction (felt resistance)
+          // This subtracts a fixed amount from speed each tick,
+          // which is more realistic than velocity-proportional drag alone.
+          const rf = rollingFrictionRef.current;
+          if (rf > 0 && speed > 0.15) {
+            const newSpeed = Math.max(0, speed - rf);
+            const scale = newSpeed / speed;
+            Body.setVelocity(b, {
+              x: b.velocity.x * scale,
+              y: b.velocity.y * scale,
+            });
           }
         });
     });
@@ -878,28 +902,53 @@ export default function SnookerGame() {
 
         {settingsOpen && (
           <div className="settings-body">
-            {/* Surface Friction */}
+            {/* Air Drag (frictionAir) — velocity-proportional */}
             <div className="setting-row">
               <label className="setting-label">
-                Friction
-                <span className="setting-value">{friction.toFixed(3)}</span>
+                Air Drag
+                <span className="setting-value">{frictionAir.toFixed(3)}</span>
               </label>
               <input
                 type="range"
                 className="setting-slider"
                 min={0}
-                max={0.5}
-                step={0.005}
-                value={friction}
+                max={0.06}
+                step={0.002}
+                value={frictionAir}
                 onChange={(e) => {
                   const v = parseFloat(e.target.value);
-                  setFriction(v);
-                  applyPhysicsSettings(v, density);
+                  setFrictionAir(v);
+                  applyPhysicsSettings(v, rollingFriction, density);
+                }}
+              />
+              <div className="setting-range-labels">
+                <span>0 (none)</span>
+                <span>0.06 (heavy drag)</span>
+              </div>
+            </div>
+
+            {/* Rolling Friction — constant deceleration (felt resistance) */}
+            <div className="setting-row">
+              <label className="setting-label">
+                Rolling Friction
+                <span className="setting-value">{rollingFriction.toFixed(4)}</span>
+              </label>
+              <input
+                type="range"
+                className="setting-slider"
+                min={0}
+                max={0.003}
+                step={0.0001}
+                value={rollingFriction}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setRollingFriction(v);
+                  applyPhysicsSettings(frictionAir, v, density);
                 }}
               />
               <div className="setting-range-labels">
                 <span>0 (ice)</span>
-                <span>0.5 (rough)</span>
+                <span>0.003 (rough felt)</span>
               </div>
             </div>
 
@@ -922,7 +971,7 @@ export default function SnookerGame() {
                 onChange={(e) => {
                   const v = parseFloat(e.target.value);
                   setDensity(v);
-                  applyPhysicsSettings(friction, v);
+                  applyPhysicsSettings(frictionAir, rollingFriction, v);
                 }}
               />
               <div className="setting-range-labels">
@@ -935,10 +984,12 @@ export default function SnookerGame() {
             <button
               className="btn btn-defaults"
               onClick={() => {
-                setFriction(DEFAULTS.friction);
+                setFrictionAir(DEFAULTS.frictionAir);
+                setRollingFriction(DEFAULTS.rollingFriction);
                 setDensity(DEFAULTS.density);
                 applyPhysicsSettings(
-                  DEFAULTS.friction,
+                  DEFAULTS.frictionAir,
+                  DEFAULTS.rollingFriction,
                   DEFAULTS.density
                 );
               }}
